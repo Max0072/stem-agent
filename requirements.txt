@@ -1,0 +1,4 @@
+ddgs
+openai
+requests
+python-dotenv
