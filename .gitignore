@@ -2,3 +2,7 @@
 /.jbeval
 /.idea
 /.venv
+__pycache__/
+*.pkl
+eval_log.json
+*.docx

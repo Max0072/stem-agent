@@ -1,28 +1,21 @@
 import os
 import json
-from openai import OpenAI
-from SQL_dataset import benchmark
+import textwrap
+import pickle
+from concurrent.futures import ThreadPoolExecutor
 
+from openai import OpenAI
 from dotenv import load_dotenv
 from ddgs import DDGS
 import requests
 
-import textwrap
-import pickle
-import re
-from concurrent.futures import ThreadPoolExecutor
+from SQL_dataset import benchmark
 
 load_dotenv()
 
 MODEL = "gpt-4o-mini"
-# MODEL = "claude-sonnet-4-6"
-# MODEL = "claude-haiku-4-5-20251001"
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-# client = OpenAI(
-#     api_key=os.environ.get("ANTHROPIC_API_KEY"),
-#     base_url="https://api.anthropic.com/v1/"
-# )
 
 class Scraper:
     def __init__(self, task_class, weak_areas: str = "", existing_knowledge: str = ""):
@@ -68,13 +61,11 @@ class Scraper:
         return [q.strip() for q in queries if q.strip()]
 
     def _web_search(self, query):
-        """Search DuckDuckGo, return list of URLs."""
         with DDGS() as ddgs:
             results = ddgs.text(query, max_results=2)
             return [r["href"] for r in results]
 
     def _fetch_page(self, url):
-        """Fetch full page content via Jina Reader."""
         try:
             response = requests.get(f"https://r.jina.ai/{url}", timeout=10)
             return response.text[:10000]
@@ -109,31 +100,25 @@ class Scraper:
         return response.choices[0].message.content
 
     def scrape(self):
-        """Research domain, extract actionable insights."""
-
-        # ====== Generating queries ======
-        print("Generating queries...")
+        print("generating queries...")
         queries = self._generate_search_queries()
-        print(queries)
+        for i, q in enumerate(queries, 1):
+            print(f"  {i}. {q}")
 
-        # ===== Collecting raw texts =====
-        print("Fetching pages, collecting raw texts...")
+        print("fetching pages...")
         raw_texts = []
         for query in queries:
             urls = self._web_search(query)
             for url in urls:
-                print(url)
+                print(f"  {url}")
                 text = self._fetch_page(url)
                 if text:
                     raw_texts.append(text)
         total_chars = sum(len(t) for t in raw_texts)
-        print(f"Scraped {len(raw_texts)} pages, {total_chars:,} chars")
+        print(f"{len(raw_texts)} pages, {total_chars:,} chars")
 
-        # ========= Summarizing ==========
         print("Summarizing...")
-        summary = self.summarize(raw_texts)
-
-        return summary
+        return self.summarize(raw_texts)
 
 
 class StemAgent:
@@ -172,10 +157,8 @@ class StemAgent:
                 """
             }]
         )
-        prompt = response.choices[0].message.content
-
-        self.prompt = prompt
-        return prompt
+        self.prompt = response.choices[0].message.content
+        return self.prompt
 
     def update_workflow(self):
         response = client.chat.completions.create(
@@ -198,10 +181,9 @@ class StemAgent:
             }]
         )
         lines = response.choices[0].message.content.strip().split("\n")
-        self.workflow = [re.sub(r'^\d+[\.\)]\s*', '', s.strip()) for s in lines if s.strip()]
+        self.workflow = [s.strip() for s in lines if s.strip()]
 
     def execute(self, task: str) -> str:
-        """Solve a task using current prompt and workflow."""
         if not self.workflow:
             response = client.chat.completions.create(
                 model=MODEL,
@@ -222,8 +204,7 @@ class StemAgent:
         )
         return response.choices[0].message.content
 
-    def evaluate(self, benchmark: list[dict], log_path: str = "eval_log.json") -> float:
-        """Score current performance. Updates self.weak_areas with failed cases."""
+    def evaluate(self, dataset: list[dict], log_path: str = "eval_log.json") -> float:
         def process(item):
             response = self.execute(item["task"])
             solution = item["solution"]
@@ -255,7 +236,7 @@ class StemAgent:
                     "response": response, "judge_raw": judge_output, "verdicts": verdicts}
 
         with ThreadPoolExecutor(max_workers=10) as executor:
-            log_entries = list(executor.map(process, benchmark))
+            log_entries = list(executor.map(process, dataset))
 
         total = 0
         found = 0
@@ -284,12 +265,10 @@ class StemAgent:
         return found / total if total > 0 else 0.0
 
     def is_improving(self, patience: int = 3) -> bool:
-        """Early stopping: return False if score hasn't improved in `patience` iterations."""
         if len(self.score_history) < patience:
             return True
         recent = self.score_history[-patience:]
         return recent[-1] > recent[0]
-
 
     def save(self, path: str = "checkpoint.pkl"):
         with open(path, "wb") as f:
@@ -300,37 +279,31 @@ class StemAgent:
         with open(path, "rb") as f:
             return pickle.load(f)
 
-    def evolve(self, benchmark: list[dict], max_iterations: int = 10):
-        print(f"Starting evolution: task_class='{self.task_class}', max_iterations={max_iterations}")
+    def evolve(self, dataset: list[dict], max_iterations: int = 10):
+        print(f"Evolution: {self.task_class}")
 
-        # ========= Initial score =========
-        score = self.evaluate(benchmark)
+        score = self.evaluate(dataset)
         best_score = score
         print(f"[before] score: {score:.2f}")
-        if self.weak_areas:
-            print(f"weak areas:\n{self.weak_areas}\n")
 
-        # ============= Loop ==============
-        for i in range(max_iterations):
+        for _ in range(max_iterations):
             self.iteration_count += 1
-            print(f"\n--- iteration {self.iteration_count} ---")
+            print(f"\n{"="*55}\n{" "*20}ITERATION {self.iteration_count}{" "*20}\n{"="*55}")
 
-            self.scrape()                       # Scraping
-            self.update_prompt()                # Updating prompt
-            self.update_workflow()              # Updating workflow
-            print(f"prompt:\n{self.prompt}\n")
-            print(f"workflow:\n" + "\n".join(f"  {s}" for i, s in enumerate(self.workflow)) + "\n")
+            self.scrape()
+            self.update_prompt()
+            self.update_workflow()
+            print(f"======= Prompt =======\n{self.prompt}\n{"-"*55}")
+            print("======= Workflow =======\n" + "\n".join(f"  {s}" for s in self.workflow) + f"\n{"-"*55}")
 
-            score = self.evaluate(benchmark)    # Evaluation
+            score = self.evaluate(dataset)
             self.score_history.append(score)
             print(f"score: {score:.2f}")
-            if self.weak_areas:
-                print(f"weak areas:\n{self.weak_areas}\n")
 
-            self.save()                         # Save last
+            self.save()
             if score > best_score:
                 best_score = score
-                self.save("checkpoint_best.pkl")  # Save best
+                self.save("checkpoint_best.pkl")
 
             if score == 1.0 or not self.is_improving():
                 print("early stopping")
