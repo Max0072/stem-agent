@@ -10,6 +10,7 @@ import requests
 import textwrap
 import pickle
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 
@@ -94,6 +95,8 @@ class Scraper:
                 - Non-obvious patterns experts use but beginners miss
                 - Real failure modes and how to detect them
                 - Subtle semantic differences between similar constructs
+
+                If a piece of material is not directly relevant to {self.task_class} — ignore it completely.
 
                 Structure the output in whatever way best fits the {self.task_class} domain.
                 Be specific. Use examples. Avoid platitudes.
@@ -221,19 +224,13 @@ class StemAgent:
 
     def evaluate(self, benchmark: list[dict], log_path: str = "eval_log.json") -> float:
         """Score current performance. Updates self.weak_areas with failed cases."""
-        total = 0
-        found = 0
-        missed = []
-        log_entries = []
-
-        for item in benchmark:
+        def process(item):
             response = self.execute(item["task"])
             solution = item["solution"]
-            total += len(solution)
-
             solution_list = "\n".join(f"{i+1}. {s}" for i, s in enumerate(solution))
             judge = client.chat.completions.create(
                 model=MODEL,
+                temperature=0,
                 messages=[{ # type: ignore
                     "role": "user",
                     "content": f"""
@@ -252,29 +249,25 @@ class StemAgent:
             )
             judge_output = judge.choices[0].message.content.strip()
             lines = judge_output.lower().splitlines()
-            verdicts = []
-            missed_this = False
-            for i in range(len(solution)):
-                answer = lines[i] if i < len(lines) else ""
-                hit = "yes" in answer
-                verdicts.append({"bug": solution[i], "found": hit})
-                if hit:
+            verdicts = [{"bug": solution[i], "found": "yes" in (lines[i] if i < len(lines) else "")}
+                        for i in range(len(solution))]
+            return {"iteration": self.iteration_count, "task": item["task"],
+                    "response": response, "judge_raw": judge_output, "verdicts": verdicts}
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            log_entries = list(executor.map(process, benchmark))
+
+        total = 0
+        found = 0
+        missed = []
+        for entry in log_entries:
+            for v in entry["verdicts"]:
+                total += 1
+                if v["found"]:
                     found += 1
-                else:
-                    missed_this = True
+            if not all(v["found"] for v in entry["verdicts"]):
+                missed.append(entry["task"])
 
-            log_entries.append({
-                "iteration": self.iteration_count,
-                "task": item["task"],
-                "response": response,
-                "judge_raw": judge_output,
-                "verdicts": verdicts,
-            })
-
-            if missed_this:
-                missed.append(item["task"])
-
-        # Append to log file
         try:
             with open(log_path, "r") as f:
                 existing = json.load(f)
@@ -312,6 +305,7 @@ class StemAgent:
 
         # ========= Initial score =========
         score = self.evaluate(benchmark)
+        best_score = score
         print(f"[before] score: {score:.2f}")
         if self.weak_areas:
             print(f"weak areas:\n{self.weak_areas}\n")
@@ -333,14 +327,17 @@ class StemAgent:
             if self.weak_areas:
                 print(f"weak areas:\n{self.weak_areas}\n")
 
-            self.save()                         # Save state
+            self.save()                         # Save last
+            if score > best_score:
+                best_score = score
+                self.save("checkpoint_best.pkl")  # Save best
 
             if score == 1.0 or not self.is_improving():
                 print("early stopping")
                 break
 
         if self.score_history:
-            print(f"\n[done] iterations: {self.iteration_count}, final score: {self.score_history[-1]:.2f}")
+            print(f"\n[done] iterations: {self.iteration_count}, final score: {self.score_history[-1]:.2f}, best score: {best_score:.2f}")
 
 
 if __name__ == "__main__":
